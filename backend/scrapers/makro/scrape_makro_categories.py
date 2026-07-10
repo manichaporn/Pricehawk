@@ -1,14 +1,17 @@
 #!/usr/bin/env python3
 """
-Makro category scraper - Discovery ONCE, then Enrichment per branch,
-sequentially, one branch fully completed (enriched + written to its own
-file) before the next branch starts.
+Makro category scraper - Discovery ONCE, then Enrichment per branch, up to
+MAX_CONCURRENT_BRANCHES branches running at the same time. Each branch still
+gets its own single-storeCode GraphQL calls and its own output file/DB
+writes exactly as before - nothing about the request shape changed, only
+how many of these independent per-branch runs are in flight at once.
 
 Every field/column is exactly what the original single-branch version had -
 nothing removed or restructured. Edit BRANCH_STORE_CODES below to change
-which branches get scraped, and DISCOVERY_STORE_CODE to change which single
+which branches get scraped, DISCOVERY_STORE_CODE to change which single
 branch's context is used for the (branch-independent, spot-checked)
-Fresh & Frozen page crawl.
+Fresh & Frozen page crawl, and MAX_CONCURRENT_BRANCHES to change how many
+branches run in parallel.
 
 Techniques used (see MAKRO_API_REFERENCE_BRIEF.md for full rationale/evidence):
   - Type A categories (Dry Grocery, Beverages, Snacks, Seafood, Meat):
@@ -35,6 +38,7 @@ Techniques used (see MAKRO_API_REFERENCE_BRIEF.md for full rationale/evidence):
     only one store in the query.
 """
 
+import concurrent.futures
 import json
 import os
 import re
@@ -60,19 +64,22 @@ DISCOVERY_STORE_CODE = "03"       # Srinakarin (422 Moo 5, Srinakarin Road,
                                    # Samutprakarn 10270)
 
 # Every branch listed here gets its own full enrichment pass and its own
-# output file, run sequentially (one branch fully finishes, including being
-# written to disk, before the next one starts) - never combined into one
-# multi-storeCode call, so every AMBIGUOUS field stays safe to read as-is.
+# output file - never combined into one multi-storeCode call, so every
+# AMBIGUOUS field (seller, status, displayPrice, slabPrices, ...) stays safe
+# to read as-is. What changes with concurrency is only how many of these
+# independent per-branch runs are in flight at the same time (see
+# MAX_CONCURRENT_BRANCHES below), not the shape of any request.
 BRANCH_STORE_CODES = [
     "156", "03", "41", "62", "166", "27", "140", "18", "136", "161",
     "12", "15", "06", "162", "44", "804", "08", "01", "10", "09",
 ]
 
-# This is what BRANCH_STORE_CODE (single value) becomes during each branch's
-# enrichment run - set by the loop in main(), read by fetch_flexi_page/
-# enrich_batch exactly like before. Left here so the rest of the file below
-# (queries, row-building) is completely unchanged from the single-branch
-# version.
+# This is only used by fetch_flexi_page() during the ONE-TIME, single-
+# threaded Fresh & Frozen discovery pass in Step 2 of main() - before any
+# branch worker starts. It is fixed to DISCOVERY_STORE_CODE and never
+# reassigned; per-branch enrichment threads each pass their own branch_code
+# explicitly into enrich_batch() instead of touching this global (a shared
+# mutable global would be a race condition once branches run concurrently).
 BRANCH_STORE_CODE = DISCOVERY_STORE_CODE
 
 # One output file per branch, stamped with the date+time this run started -
@@ -82,10 +89,22 @@ BRANCH_STORE_CODE = DISCOVERY_STORE_CODE
 # group together by filename alone.
 OUTPUT_CSV_TEMPLATE = os.path.join(_HERE, "output_{run_ts}_branch_{code}.csv")
 
-# Pause between finishing one branch's enrichment+write and starting the
-# next one's - separate from (and on top of) the existing 0.3s pause between
-# enrichment batches within a single branch.
-RATE_LIMIT_BETWEEN_BRANCHES_SECONDS = 5.0
+# How many branches run at the same time. Each branch takes roughly
+# 15-20 minutes end to end (enrichment batches + CSV + DB write), so 20
+# branches fully sequential is ~6-7 hours; at 8 concurrent it's ~20 branches
+# / 8 workers ~= 2.5 "waves" ~= 40-50 minutes, which is what fits the
+# "all 20 branches inside about an hour" target. Raise this if it's still
+# comfortably fast and no 403/429s show up in the logs - the marketplace and
+# search APIs showed no rate limiting or bot protection in testing (see
+# Part 6 of DEPLOYMENT_HANDBOOK.md); lower it if you ever do see one.
+MAX_CONCURRENT_BRANCHES = 8
+
+# Small delay between *starting* consecutive branch workers, so the first
+# MAX_CONCURRENT_BRANCHES branches don't all fire their very first request
+# in the same instant. Only affects the initial ramp-up - once the pool is
+# full, a new branch only starts when another one finishes, which already
+# staggers things naturally.
+STAGGER_START_SECONDS = 3.0
 
 # Real branch names, from the earlier makro.co.th scrape (fetch_branch_postcodes.py)
 # - used for the branch_name column in the DB write. Deliberately NOT sourced
@@ -342,12 +361,12 @@ query products($ids: [String!]!, $storeCodes: [String!], $lang: String, $country
 """
 
 
-def enrich_batch(product_ids: list[str]) -> list[dict]:
+def enrich_batch(product_ids: list[str], store_code: str) -> list[dict]:
     body = {
         "operationName": "products",
         "variables": {
             "ids": product_ids,
-            "storeCodes": [BRANCH_STORE_CODE],
+            "storeCodes": [store_code],
             "lang": "th", "countryCode": "TH",
         },
         "query": ENRICH_QUERY,
@@ -541,17 +560,18 @@ def enrich_and_write_branch(branch_code: str, run_ts: str, all_products: dict,
     """Runs enrichment + writes the output file (and DB rows, if configured)
     for ONE branch, start to finish, before returning. Field list and
     row-building logic are exactly what the original single-branch version
-    had - unchanged."""
-    global BRANCH_STORE_CODE
-    BRANCH_STORE_CODE = branch_code
+    had - unchanged. Safe to call from multiple threads at once: branch_code
+    is passed explicitly all the way down to enrich_batch() rather than
+    going through any shared mutable state, and every branch writes to its
+    own CSV file and (for the DB) its own psycopg2 connection."""
 
     # ---- Step 3: Enrichment, batched, this branch only ----
     enriched_by_id = {}
     for i in range(0, len(product_ids), ENRICH_BATCH_SIZE):
         batch = product_ids[i:i + ENRICH_BATCH_SIZE]
         print(f"Enriching batch {i // ENRICH_BATCH_SIZE + 1} "
-              f"({len(batch)} products) at branch {BRANCH_STORE_CODE}...")
-        results = enrich_batch(batch)
+              f"({len(batch)} products) at branch {branch_code}...")
+        results = enrich_batch(batch, branch_code)
         for p in results:
             enriched_by_id[p["id"]] = p
         time.sleep(0.3)
@@ -631,7 +651,7 @@ def enrich_and_write_branch(branch_code: str, run_ts: str, all_products: dict,
     else:
         print("DATABASE_URL not set - skipped DB write, CSV only.")
 
-    print(f"Branch scraped: {BRANCH_STORE_CODE}\n")
+    print(f"Branch scraped: {branch_code}\n")
 
 
 # ============================================================================
@@ -704,18 +724,44 @@ def main():
 
     print(f"TOTAL unique products to enrich: {len(all_products)}\n")
 
-    # ---- Step 3: one branch at a time, sequentially, own file each ----
+    # ---- Step 3: up to MAX_CONCURRENT_BRANCHES branches at once, own file
+    # each. Each branch is still one storeCode per GraphQL call - only the
+    # orchestration (how many of these independent per-branch runs are in
+    # flight at once) is different from a strictly sequential loop. ----
     makro_ids = list(all_products.keys())
     product_ids = [all_products[mk]["doc"]["productId"] for mk in makro_ids]
 
-    for idx, branch_code in enumerate(BRANCH_STORE_CODES, 1):
-        print(f"=== Branch {idx}/{len(BRANCH_STORE_CODES)}: {branch_code} ===")
-        enrich_and_write_branch(branch_code, run_ts, all_products, product_ids, branch_names)
-        if idx < len(BRANCH_STORE_CODES):
-            print(f"Rate-limit pause ({RATE_LIMIT_BETWEEN_BRANCHES_SECONDS}s) "
-                  f"before next branch...\n")
-            time.sleep(RATE_LIMIT_BETWEEN_BRANCHES_SECONDS)
+    print(f"Running with up to {MAX_CONCURRENT_BRANCHES} branches concurrently...\n")
 
+    def _run_branch_safe(branch_code):
+        try:
+            enrich_and_write_branch(branch_code, run_ts, all_products, product_ids, branch_names)
+            return branch_code, None
+        except Exception as exc:  # noqa: BLE001 - one branch's failure must
+            return branch_code, exc  # not take down the others in the pool
+
+    failed = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_CONCURRENT_BRANCHES) as pool:
+        futures = []
+        for i, branch_code in enumerate(BRANCH_STORE_CODES):
+            print(f"Starting branch {branch_code} ({i + 1}/{len(BRANCH_STORE_CODES)})...")
+            futures.append(pool.submit(_run_branch_safe, branch_code))
+            if i < min(MAX_CONCURRENT_BRANCHES, len(BRANCH_STORE_CODES)) - 1:
+                time.sleep(STAGGER_START_SECONDS)
+
+        done = 0
+        for future in concurrent.futures.as_completed(futures):
+            branch_code, exc = future.result()
+            done += 1
+            if exc is not None:
+                failed.append(branch_code)
+                print(f"[{done}/{len(BRANCH_STORE_CODES)}] Branch {branch_code} FAILED: {exc}")
+            else:
+                print(f"[{done}/{len(BRANCH_STORE_CODES)}] Branch {branch_code} complete.")
+
+    if failed:
+        print(f"\n{len(failed)} branch(es) failed and were skipped: {failed}. "
+              f"Re-run with BRANCH_STORE_CODES set to just this list to retry them.")
     print(f"\nAll {len(BRANCH_STORE_CODES)} branches done. Run: {run_ts}")
 
 
