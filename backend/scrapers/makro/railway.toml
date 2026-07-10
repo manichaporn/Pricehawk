@@ -1,0 +1,12 @@
+[build]
+builder = "RAILPACK"
+
+# Cron job for the Makro multi-branch price scraper. Root directory for this
+# service should be set to backend/scrapers/makro in Railway's service
+# settings, so this file and requirements.txt are picked up from here.
+[[cron]]
+schedule = "0 1 * * *"  # Daily at 01:00 - the ~20 branch run finishes in
+                         # roughly an hour with MAX_CONCURRENT_BRANCHES = 8
+                         # (see scrape_makro_categories.py), well before
+                         # normal business hours.
+command = "python3 scrape_makro_categories.py"
